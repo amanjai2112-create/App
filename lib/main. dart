@@ -1,0 +1,341 @@
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+
+void main() {
+  runApp(const MaterialApp(
+    home: HomeScreen(),
+    debugShowCheckedModeBanner: false,
+  ));
+}
+
+class Question {
+  final String question;
+  final List<String> options;
+  final int correctIndex;
+  final String subject;
+
+  Question({
+    required this.question,
+    required this.options,
+    required this.correctIndex,
+    required this.subject,
+  });
+
+  factory Question.fromJson(Map<String, dynamic> json) {
+    return Question(
+      question: json['question'] ?? '',
+      options: List<String>.from(json['options'] ?? []),
+      correctIndex: json['correct_index'] ?? 0,
+      subject: json['subject'] ?? 'General',
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'question': question,
+    'options': options,
+    'correct_index': correctIndex,
+    'subject': subject,
+  };
+}
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  List<Map<String, dynamic>> savedTests = [];
+  bool isLoading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    loadSavedTests();
+  }
+
+  Future<void> loadSavedTests() async {
+    final prefs = await SharedPreferences.getInstance();
+    final String? data = prefs.getString('saved_neet_tests');
+    if (data != null) {
+      setState(() {
+        savedTests = List<Map<String, dynamic>>.from(json.decode(data));
+      });
+    }
+  }
+
+  Future<void> uploadAndParsePDF() async {
+    FilePickerResult? result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['pdf'],
+      withData: true,
+    );
+
+    if (result != null && result.files.single.bytes != null) {
+      setState(() => isLoading = true);
+      try {
+        var request = http.MultipartRequest(
+          'POST',
+          // Replace with your FastAPI backend URL (use 10.0.2.2 for Android emulator)
+          Uri.parse('http://10.0.2.2:8000/convert-pdf'),
+        );
+
+        request.files.add(http.MultipartFile.fromBytes(
+          'file',
+          result.files.single.bytes!,
+          filename: result.files.single.name,
+        ));
+
+        var response = await request.send();
+        if (response.statusCode == 200) {
+          var respStr = await response.stream.bytesToString();
+          var testJson = json.decode(respStr);
+
+          // Save locally
+          final prefs = await SharedPreferences.getInstance();
+          savedTests.add({
+            'title': testJson['title'],
+            'date': DateTime.now().toIso8601String(),
+            'questions': testJson['questions'],
+            'last_score': null,
+          });
+          await prefs.setString('saved_neet_tests', json.encode(savedTests));
+          setState(() {});
+
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Test generated and saved successfully!')),
+          );
+        } else {
+          throw Exception('Failed to convert PDF.');
+        }
+      } catch (e) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error: ${e.toString()}')),
+        );
+      } finally {
+        setState(() => isLoading = false);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('NEET CBT Prep & Simulator'),
+        backgroundColor: Colors.teal,
+      ),
+      body: isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : savedTests.isEmpty
+              ? const Center(child: Text('No tests uploaded yet. Upload a PDF to begin.'))
+              : ListView.builder(
+                  itemCount: savedTests.length,
+                  itemBuilder: (context, index) {
+                    final test = savedTests[index];
+                    return Card(
+                      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      child: ListTile(
+                        leading: const Icon(Icons.assignment, color: Colors.teal),
+                        title: Text(test['title'] ?? 'NEET Test'),
+                        subtitle: Text(
+                          test['last_score'] != null
+                              ? 'Last Score: ${test['last_score']} | Total Questions: ${(test['questions'] as List).length}'
+                              : 'Total Questions: ${(test['questions'] as List).length}',
+                        ),
+                        trailing: ElevatedButton(
+                          onPressed: () {
+                            List<Question> qList = (test['questions'] as List)
+                                .map((q) => Question.fromJson(q))
+                                .toList();
+                            Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => ExamScreen(
+                                  testIndex: index,
+                                  testTitle: test['title'],
+                                  questions: qList,
+                                  onTestCompleted: (score) async {
+                                    final prefs = await SharedPreferences.getInstance();
+                                    savedTests[index]['last_score'] = score;
+                                    await prefs.setString(
+                                        'saved_neet_tests', json.encode(savedTests));
+                                    setState(() {});
+                                  },
+                                ),
+                              ),
+                            );
+                          },
+                          child: const Text('Start CBT'),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: uploadAndParsePDF,
+        backgroundColor: Colors.teal,
+        icon: const Icon(Icons.picture_as_pdf),
+        label: const Text('Upload PDF Paper'),
+      ),
+    );
+  }
+}
+
+class ExamScreen extends StatefulWidget {
+  final int testIndex;
+  final String testTitle;
+  final List<Question> questions;
+  final Function(int) onTestCompleted;
+
+  const ExamScreen({
+    super.key,
+    required this.testIndex,
+    required this.testTitle,
+    required this.questions,
+    required this.onTestCompleted,
+  });
+
+  @override
+  State<ExamScreen> createState() => _ExamScreenState();
+}
+
+class _ExamScreenState extends State<ExamScreen> {
+  int currentIndex = 0;
+  Map<int, int> selectedAnswers = {}; // questionIndex -> optionIndex
+
+  void calculateResult() {
+    int score = 0; // NEET marking: +4 for correct, -1 for wrong
+    int correct = 0;
+    int incorrect = 0;
+
+    selectedAnswers.forEach((qIdx, optIdx) {
+      if (optIdx == widget.questions[qIdx].correctIndex) {
+        score += 4;
+        correct++;
+      } else {
+        score -= 1;
+        incorrect++;
+      }
+    });
+
+    widget.onTestCompleted(score);
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => AlertDialog(
+        title: const Text('Exam Completed'),
+        content: Text(
+          'Total Score: $score / ${widget.questions.length * 4}\n'
+          'Correct: $correct\n'
+          'Incorrect: $incorrect\n'
+          'Unattempted: ${widget.questions.length - selectedAnswers.length}',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              Navigator.pop(context);
+            },
+            child: const Text('Finish'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final q = widget.questions[currentIndex];
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.testTitle),
+        backgroundColor: Colors.teal,
+        actions: [
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: calculateResult,
+            child: const Text('Submit Test', style: TextStyle(color: Colors.white)),
+          )
+        ],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Chip(label: Text(q.subject)),
+                Text('Q ${currentIndex + 1} of ${widget.questions.length}',
+                    style: const TextStyle(fontWeight: FontWeight.bold)),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(
+              q.question,
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 20),
+            ...List.generate(q.options.length, (optIdx) {
+              return Card(
+                color: selectedAnswers[currentIndex] == optIdx
+                    ? Colors.teal.shade100
+                    : Colors.white,
+                child: ListTile(
+                  title: Text(q.options[optIdx]),
+                  leading: Radio<int>(
+                    value: optIdx,
+                    groupValue: selectedAnswers[currentIndex],
+                    onChanged: (val) {
+                      setState(() {
+                        selectedAnswers[currentIndex] = val!;
+                      });
+                    },
+                  ),
+                  onTap: () {
+                    setState(() {
+                      selectedAnswers[currentIndex] = optIdx;
+                    });
+                  },
+                ),
+              );
+            }),
+            const Spacer(),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                ElevatedButton(
+                  onPressed: currentIndex > 0
+                      ? () => setState(() => currentIndex--)
+                      : null,
+                  child: const Text('Previous'),
+                ),
+                TextButton(
+                  onPressed: () {
+                    setState(() {
+                      selectedAnswers.remove(currentIndex);
+                    });
+                  },
+                  child: const Text('Clear Response'),
+                ),
+                ElevatedButton(
+                  onPressed: currentIndex < widget.questions.length - 1
+                      ? () => setState(() => currentIndex++)
+                      : null,
+                  child: const Text('Next'),
+                ),
+              ],
+            )
+          ],
+        ),
+      ),
+    );
+  }
+}
